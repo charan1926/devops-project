@@ -9,8 +9,13 @@ pipeline {
   stages {
     stage('Build Image') {
       steps {
-        sh 'echo FROM alpine:3.19 > Dockerfile'
-        sh 'echo CMD ["/bin/sh","-c","python3 -m http.server 8080"] >> Dockerfile'
+        sh '''cat > Dockerfile <<'DOCKER'
+FROM python:3.11-slim
+WORKDIR /app
+COPY . /app
+EXPOSE 8080
+CMD ["python3","-m","http.server","8080"]
+DOCKER'''
         sh 'docker build -t ${IMAGE}:${SHA} .'
       }
     }

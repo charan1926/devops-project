@@ -1,0 +1,3 @@
+replicaCount: 1
+image:
+  tag: "DEV_SHA_INJECTED_BY_PIPELINE"

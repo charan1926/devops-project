@@ -1,0 +1,3 @@
+replicaCount: 2
+image:
+  tag: "PROD_TAG_OR_DIGEST_SET_ON_RELEASE"

@@ -1,0 +1,3 @@
+replicaCount: 1
+image:
+  tag: "STAGE_SHA_SET_ON_PROMOTION"

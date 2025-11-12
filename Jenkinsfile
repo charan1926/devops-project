@@ -120,7 +120,6 @@ DOCKER
           withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
             sh '''
               set -e
-              # Use busybox wget (or switch to curlimages/curl if preferred)
               kubectl run smoke -n stage --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://app-stage-app:8080 | head -n1; sleep 2"
               kubectl wait --for=condition=complete pod/smoke -n stage --timeout=30s || true
               kubectl logs pod/smoke -n stage > /tmp/stage-smoke.out 2>&1 || true
@@ -140,21 +139,34 @@ DOCKER
           def watchMin = 10
           def breach = false
 
-          // Use withCredentials to load PROM URL into PROM_URL
+          // Use withCredentials to get PROM_URL into agent env and call curl from shell (no Groovy interpolation)
           withCredentials([string(credentialsId: env.PROM_CRED_ID, variable: 'PROM_URL')]) {
             for (int i = 0; i < watchMin; i++) {
-              // PromQL queries (URL-encoded below)
-              def errQuery = URLEncoder.encode('100 * ( sum(rate(http_requests_total{job=~"app.*",status=~"5.."}[5m])) / sum(rate(http_requests_total{job=~"app.*"}[5m])) )', 'UTF-8')
-              def p95Query = URLEncoder.encode('histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~"app.*"}[5m])) by (le))', 'UTF-8')
+              // run the Prometheus queries from shell and capture the JSON into Groovy variables
+              def errJson = sh(returnStdout: true, script: '''
+                set -e
+                errQuery='100 * ( sum(rate(http_requests_total{job=~"app.*",status=~"5.."}[5m])) / sum(rate(http_requests_total{job=~"app.*"}[5m])) )'
+                # use curl -G with --data-urlencode to avoid manual URL-encoding
+                curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${errQuery}"
+              ''').trim()
 
-              def errJson = sh(returnStdout: true, script: "curl -s '${PROM_URL}/api/v1/query?query=${errQuery}'") .trim()
-              def p95Json = sh(returnStdout: true, script: "curl -s '${PROM_URL}/api/v1/query?query=${p95Query}'") .trim()
+              def p95Json = sh(returnStdout: true, script: '''
+                set -e
+                p95Query='histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~"app.*"}[5m])) by (le))'
+                curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${p95Query}"
+              ''').trim()
 
               def errVal = 0.0
               def p95Val = 0.0
               try {
-                errVal = readJSON(text: errJson).data.result.size() ? readJSON(text: errJson).data.result[0].value[1].toFloat() : 0.0
-                p95Val = readJSON(text: p95Json).data.result.size() ? readJSON(text: p95Json).data.result[0].value[1].toFloat() : 0.0
+                def errParsed = readJSON(text: errJson)
+                def p95Parsed = readJSON(text: p95Json)
+                if (errParsed.data?.result?.size() > 0) {
+                  errVal = errParsed.data.result[0].value[1].toFloat()
+                }
+                if (p95Parsed.data?.result?.size() > 0) {
+                  p95Val = p95Parsed.data.result[0].value[1].toFloat()
+                }
               } catch (e) {
                 echo "Prometheus read error: ${e}. errJson=${errJson} p95Json=${p95Json}"
               }
@@ -235,7 +247,7 @@ DOCKER
       }
     }
 
-  }
+  } // end stages
 
   post {
     success {

@@ -23,7 +23,6 @@ pipeline {
 
     stage('Build Image') {
       steps {
-        // create a real python-based Dockerfile for the demo server
         sh '''cat > Dockerfile <<'DOCKER'
 FROM python:3.11-slim
 WORKDIR /app
@@ -39,7 +38,6 @@ DOCKER
     stage('Login & Push') {
       steps {
         withCredentials([usernamePassword(credentialsId: env.GHCR_CRED_ID, usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
-          // avoid Groovy interpolation warnings by using single-quoted scripts
           sh 'echo $GHCR_PAT | docker login ghcr.io -u $GHCR_USER --password-stdin'
           sh 'docker push ${IMAGE}:${SHA}'
         }
@@ -59,8 +57,19 @@ DOCKER
             # wait for new rollout
             kubectl rollout status deploy/${DEV_RELEASE}-app -n dev --timeout=180s
 
-            # simple in-cluster smoke test
-            kubectl run -n dev --rm -i --tty smoke --image=busybox:1.36 --restart=Never -- /bin/sh -c "wget -qO- http://${DEV_RELEASE}-app:8080 | head -n1"
+            # robust in-cluster smoke test (non-interactive)
+            kubectl run smoke -n dev --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://${DEV_RELEASE}-app:8080 | head -n1; sleep 2"
+            kubectl wait --for=condition=complete pod/smoke -n dev --timeout=30s || true
+            kubectl logs pod/smoke -n dev > /tmp/dev-smoke.out 2>&1 || true
+            kubectl delete pod smoke -n dev --ignore-not-found
+
+            if grep -q "<!DOCTYPE HTML>" /tmp/dev-smoke.out; then
+              echo "DEV SMOKE OK"
+            else
+              echo "DEV SMOKE FAILED - output was:"
+              cat /tmp/dev-smoke.out
+              exit 1
+            fi
           '''
         }
       }
@@ -69,7 +78,6 @@ DOCKER
     stage('Prepare Promotion Metadata') {
       steps {
         script {
-          // write a small build-report for auditing
           def report = [
             commit: env.GIT_COMMIT ?: 'local',
             image: "${env.IMAGE}:${env.SHA}",
@@ -84,7 +92,6 @@ DOCKER
     stage('Promote to STAGE (manual)') {
       steps {
         script {
-          // This blocks and shows input form in Jenkins UI
           def approval = input id: 'PromoteToStage', message: 'Approve promotion to STAGE', parameters: [
             string(name: 'IMAGE_DIGEST', defaultValue: "${IMAGE}:${SHA}", description: 'Image digest (use <repo>:<sha>)'),
             string(name: 'CHANGE_SUMMARY', defaultValue: '', description: 'One-line change summary'),
@@ -109,50 +116,73 @@ DOCKER
             """
           }
 
-          // Smoke test
+          // Smoke test (robust/non-interactive)
           withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-            sh 'kubectl run -n stage --rm -i --tty smoke --image=busybox:1.36 --restart=Never -- /bin/sh -c "wget -qO- http://app-stage-app:8080 | head -n1"'
+            sh '''
+              set -e
+              # Use busybox wget (or switch to curlimages/curl if preferred)
+              kubectl run smoke -n stage --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://app-stage-app:8080 | head -n1; sleep 2"
+              kubectl wait --for=condition=complete pod/smoke -n stage --timeout=30s || true
+              kubectl logs pod/smoke -n stage > /tmp/stage-smoke.out 2>&1 || true
+              kubectl delete pod smoke -n stage --ignore-not-found
+
+              if grep -q "<!DOCTYPE HTML>" /tmp/stage-smoke.out; then
+                echo "STAGE SMOKE OK"
+              else
+                echo "STAGE SMOKE FAILED - output was:"
+                cat /tmp/stage-smoke.out
+                exit 1
+              fi
+            '''
           }
 
           // Watch metrics from Prometheus for watch window (10 minutes)
-          def promUrl = credentials(env.PROM_CRED_ID)
           def watchMin = 10
           def breach = false
-          for (int i = 0; i < watchMin; i++) {
-            // PromQL queries (URL-encoded below)
-            def errQuery = URLEncoder.encode('100 * ( sum(rate(http_requests_total{job=~"app.*",status=~"5.."}[5m])) / sum(rate(http_requests_total{job=~"app.*"}[5m])) )', 'UTF-8')
-            def p95Query = URLEncoder.encode('histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~"app.*"}[5m])) by (le))', 'UTF-8')
 
-            def errJson = sh(returnStdout: true, script: "curl -s '${promUrl}/api/v1/query?query=${errQuery}'") .trim()
-            def p95Json = sh(returnStdout: true, script: "curl -s '${promUrl}/api/v1/query?query=${p95Query}'") .trim()
+          // Use withCredentials to load PROM URL into PROM_URL
+          withCredentials([string(credentialsId: env.PROM_CRED_ID, variable: 'PROM_URL')]) {
+            for (int i = 0; i < watchMin; i++) {
+              // PromQL queries (URL-encoded below)
+              def errQuery = URLEncoder.encode('100 * ( sum(rate(http_requests_total{job=~"app.*",status=~"5.."}[5m])) / sum(rate(http_requests_total{job=~"app.*"}[5m])) )', 'UTF-8')
+              def p95Query = URLEncoder.encode('histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~"app.*"}[5m])) by (le))', 'UTF-8')
 
-            def errVal = 0.0
-            def p95Val = 0.0
-            try {
-              errVal = readJSON(text: errJson).data.result.size() ? readJSON(text: errJson).data.result[0].value[1].toFloat() : 0.0
-              p95Val = readJSON(text: p95Json).data.result.size() ? readJSON(text: p95Json).data.result[0].value[1].toFloat() : 0.0
-            } catch (e) {
-              echo "Prometheus read error: ${e}. errJson=${errJson} p95Json=${p95Json}"
+              def errJson = sh(returnStdout: true, script: "curl -s '${PROM_URL}/api/v1/query?query=${errQuery}'") .trim()
+              def p95Json = sh(returnStdout: true, script: "curl -s '${PROM_URL}/api/v1/query?query=${p95Query}'") .trim()
+
+              def errVal = 0.0
+              def p95Val = 0.0
+              try {
+                errVal = readJSON(text: errJson).data.result.size() ? readJSON(text: errJson).data.result[0].value[1].toFloat() : 0.0
+                p95Val = readJSON(text: p95Json).data.result.size() ? readJSON(text: p95Json).data.result[0].value[1].toFloat() : 0.0
+              } catch (e) {
+                echo "Prometheus read error: ${e}. errJson=${errJson} p95Json=${p95Json}"
+              }
+
+              echo "Prometheus check ${i+1}/${watchMin}: error_rate=${errVal}%, p95=${p95Val}s"
+
+              if (errVal > 2.0 || p95Val > 0.5) {
+                breach = true
+                echo "SLO breach detected: err=${errVal}, p95=${p95Val}"
+                break
+              }
+              sleep time: 60, unit: 'SECONDS'
             }
-
-            echo "Prometheus check ${i+1}/${watchMin}: error_rate=${errVal}%, p95=${p95Val}s"
-
-            if (errVal > 2.0 || p95Val > 0.5) {
-              breach = true
-              echo "SLO breach detected: err=${errVal}, p95=${p95Val}"
-              break
-            }
-            sleep time: 60, unit: 'SECONDS'
-          }
+          } // end withCredentials PROM_URL
 
           if (breach) {
             echo 'Detected breach — rolling back stage canary'
             withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-              // rollback to previous helm revision
-              sh """
+              sh '''
                 set -e
-                helm rollback ${STAGE_RELEASE} \$(helm history ${STAGE_RELEASE} -n stage --max 2 --output json | jq -r '.[0].revision')
-              """
+                # pick the previous revision safely. If there is no [1], fallback to [0]
+                prev_rev=$(helm history ${STAGE_RELEASE} -n stage --max 2 --output json | jq -r '.[1].revision // .[0].revision')
+                if [ -z "$prev_rev" ]; then
+                  echo "No previous helm revision found, aborting rollback"
+                  exit 1
+                fi
+                helm rollback ${STAGE_RELEASE} $prev_rev -n stage
+              '''
             }
             error "Promotion aborted: SLO breach"
           } else {
@@ -175,20 +205,17 @@ DOCKER
       } // end steps
     } // end Stage promotion
 
-    // Optional: Prod release stage; runs only when this job is built for a tag
     stage('Release to PROD (tag-driven)') {
       when {
-        expression { return env.GIT_TAG ?: false } // runs when Jenkins builds a tag (may vary by setup)
+        expression { return env.GIT_TAG ?: false }
       }
       steps {
         script {
-          // Validate tag / produce release notes
           def tag = env.GIT_TAG ?: env.BRANCH_NAME
           echo "Releasing tag: ${tag}"
 
-          def imageToUse = "${IMAGE}:${SHA}" // adapt if you store digest per build
+          def imageToUse = "${IMAGE}:${SHA}"
 
-          // require an approval (simple input)
           input message: "Approve release ${tag} to PROD?", parameters: [string(name:'CHANGELOG', defaultValue:'', description:'Release notes')]
 
           withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
@@ -203,13 +230,12 @@ DOCKER
             """
           }
 
-          // Post-release: you can call a script to snapshot dashboards or create GitHub Release
           echo "Prod release done for ${tag}"
         }
       }
     }
 
-  } // end stages
+  }
 
   post {
     success {
@@ -223,4 +249,3 @@ DOCKER
     }
   }
 }
-

@@ -218,9 +218,12 @@ DOCKER
     } // end Stage promotion
 
     stage('Release to PROD (tag-driven)') {
-      when {
-        expression { return env.GIT_TAG ?: false }
+    when {
+      expression {
+        // run on tag OR if FORCE_PROD is explicitly set to "true"
+        return (env.GIT_TAG ?: '') as boolean || (env.FORCE_PROD == 'true')
       }
+    }
       steps {
         script {
           def tag = env.GIT_TAG ?: env.BRANCH_NAME

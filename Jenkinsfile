@@ -1,6 +1,14 @@
 pipeline {
   agent any
-  options { timestamps() }
+  options {
+    timestamps()
+    // allow manual override paths to run even if earlier stages are unstable/failed
+    skipStagesAfterUnstable(false)
+  }
+  parameters {
+    booleanParam(name: 'FORCE_PROD', defaultValue: false, description: 'Force PROD deployment even if earlier stages failed')
+  }
+
   environment {
     IMAGE         = 'ghcr.io/charan1926/devops-project'
     DEV_RELEASE   = 'app-dev'
@@ -42,7 +50,6 @@ docker build -t "$IMAGE:$SHA" .
     stage('Login & Push') {
       steps {
         withCredentials([usernamePassword(credentialsId: env.GHCR_CRED_ID, usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
-          // DO NOT interpolate secrets in Groovy; use shell expansion of $GHCR_PAT/$GHCR_USER
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
@@ -65,7 +72,7 @@ helm upgrade --install "$DEV_RELEASE" charts/app -n dev --create-namespace \
 
 kubectl rollout status deploy/"$DEV_RELEASE"-app -n dev --timeout=180s
 
-# Run a short-lived smoke pod that should finish (use Job in prod)
+# Run a short-lived smoke pod that should finish quickly
 kubectl run smoke -n dev --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://$DEV_RELEASE-app:8080 | head -n1; sleep 2"
 
 timeout_seconds=60; interval=3; elapsed=0
@@ -129,7 +136,7 @@ fi
 
           echo "Promotion approved. Inputs: ${approval}"
 
-          // compute IMAGE_TAG in Groovy (safe) so we don't rely on shell parsing later
+          // compute IMAGE_TAG in Groovy (safe)
           def imageDigest = approval.IMAGE_DIGEST as String
           def imageTag = imageDigest.contains(':') ? imageDigest.split(':')[-1] : env.SHA
 
@@ -247,7 +254,6 @@ helm rollback "$STAGE_RELEASE" "$prev_rev" -n stage
             error "Promotion aborted: SLO breach"
           } else {
             echo 'No breach — scaling to final replicas'
-            // scale to final replicas using Groovy-derived imageTag and user target
             withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
               sh """#!/usr/bin/env bash
 set -euo pipefail
@@ -270,11 +276,23 @@ kubectl rollout status deploy/"$STAGE_RELEASE"-app -n stage --timeout=240s
     stage('Release to PROD (tag-driven)') {
       when {
         expression {
-          return (env.GIT_TAG ?: '') as boolean || (env.FORCE_PROD == 'true')
+          // Run if there's a tag OR user explicitly set FORCE_PROD to true
+          return (env.GIT_TAG ?: '') as boolean || (params.FORCE_PROD == true)
         }
       }
       steps {
         script {
+          // If build already failed/unstable and user didn't set FORCE_PROD, skip to be safe.
+          if ((currentBuild.currentResult == 'FAILURE' || currentBuild.currentResult == 'UNSTABLE') && !params.FORCE_PROD) {
+            echo "Pipeline is in ${currentBuild.currentResult} state. Skipping PROD unless FORCE_PROD is true."
+            error "Skipping PROD due to earlier failures"
+          }
+
+          // If forcing despite failures, require an extra confirmation
+          if ((currentBuild.currentResult == 'FAILURE' || currentBuild.currentResult == 'UNSTABLE') && params.FORCE_PROD) {
+            input message: "Pipeline is ${currentBuild.currentResult}. You have set FORCE_PROD=true. Confirm you want to PROCEED to PROD (this will be recorded)."
+          }
+
           def tag = env.GIT_TAG ?: env.BRANCH_NAME
           echo "Releasing tag: ${tag}"
 

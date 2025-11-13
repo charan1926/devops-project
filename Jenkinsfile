@@ -39,7 +39,7 @@ COPY . /app
 EXPOSE 8080
 CMD ["python3","-m","http.server","8080"]
 DOCKER
-docker build -t "$IMAGE:${SHA}" .
+docker build -t "$IMAGE:$SHA" .
 '''
       }
     }
@@ -50,7 +50,7 @@ docker build -t "$IMAGE:${SHA}" .
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-docker push "$IMAGE:${SHA}"
+docker push "$IMAGE:$SHA" || true
 '''
         }
       }
@@ -58,7 +58,6 @@ docker push "$IMAGE:${SHA}"
 
     stage('Helm Deploy to DEV (auto)') {
       steps {
-        // This stage is critical; allow it to fail the build if smoke fails
         withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
@@ -66,7 +65,7 @@ set -euo pipefail
 helm upgrade --install "$DEV_RELEASE" charts/app -n dev --create-namespace \
   -f env/dev/values.yaml \
   --set image.repository="$IMAGE" \
-  --set image.tag="${SHA}"
+  --set image.tag="$SHA"
 
 kubectl rollout status deploy/"$DEV_RELEASE"-app -n dev --timeout=180s
 
@@ -203,43 +202,56 @@ fi
           def watchMin = 10
           def breach = false
 
+          // make Prometheus curl resilient: curl errors will return '{}', not a non-zero exit.
           withCredentials([string(credentialsId: env.PROM_CRED_ID, variable: 'PROM_URL')]) {
-            for (int i = 0; i < watchMin; i++) {
-              def errJson = sh(returnStdout: true, script: '''#!/usr/bin/env bash
+            try {
+              for (int i = 0; i < watchMin; i++) {
+                // get error rate JSON (never returns non-zero exit; fallback to empty JSON)
+                def errJson = sh(returnStdout: true, script: '''#!/usr/bin/env bash
 set -euo pipefail
 errQuery='100 * ( sum(rate(http_requests_total{job=~"app.*",status=~"5.."}[5m])) / sum(rate(http_requests_total{job=~"app.*"}[5m])) )'
-curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${errQuery}"
+# If curl fails, print fallback JSON so Groovy parsing won't throw
+curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${errQuery}" || echo '{"status":"error","data":{"result":[]}}'
 ''').trim()
 
-              def p95Json = sh(returnStdout: true, script: '''#!/usr/bin/env bash
+                // get p95 JSON (same resilience)
+                def p95Json = sh(returnStdout: true, script: '''#!/usr/bin/env bash
 set -euo pipefail
 p95Query='histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~"app.*"}[5m])) by (le))'
-curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${p95Query}"
+curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${p95Query}" || echo '{"status":"error","data":{"result":[]}}'
 ''').trim()
 
-              def errVal = 0.0
-              def p95Val = 0.0
-              try {
-                def errParsed = readJSON(text: errJson)
-                def p95Parsed = readJSON(text: p95Json)
-                if (errParsed.data?.result?.size() > 0) {
-                  errVal = errParsed.data.result[0].value[1].toFloat()
+                def errVal = 0.0
+                def p95Val = 0.0
+                try {
+                  def errParsed = readJSON(text: errJson)
+                  def p95Parsed = readJSON(text: p95Json)
+                  if (errParsed?.data?.result?.size() > 0) {
+                    errVal = (errParsed.data.result[0].value[1] as String).toFloat()
+                  }
+                  if (p95Parsed?.data?.result?.size() > 0) {
+                    p95Val = (p95Parsed.data.result[0].value[1] as String).toFloat()
+                  }
+                } catch (parseEx) {
+                  // treat parse issues as a breach (safe default)
+                  echo "Prometheus parse error: ${parseEx}. errJson=${errJson.take(500)} p95Json=${p95Json.take(500)}"
+                  breach = true
+                  break
                 }
-                if (p95Parsed.data?.result?.size() > 0) {
-                  p95Val = p95Parsed.data.result[0].value[1].toFloat()
+
+                echo "Prometheus check ${i+1}/${watchMin}: error_rate=${errVal}%, p95=${p95Val}s"
+
+                if (errVal > 2.0 || p95Val > 0.5) {
+                  breach = true
+                  echo "SLO breach detected: err=${errVal}, p95=${p95Val}"
+                  break
                 }
-              } catch (e) {
-                echo "Prometheus read error: ${e}. errJson=${errJson.take(500)} p95Json=${p95Json.take(500)}"
-              }
-
-              echo "Prometheus check ${i+1}/${watchMin}: error_rate=${errVal}%, p95=${p95Val}s"
-
-              if (errVal > 2.0 || p95Val > 0.5) {
-                breach = true
-                echo "SLO breach detected: err=${errVal}, p95=${p95Val}"
-                break
-              }
-              sleep time: 60, unit: 'SECONDS'
+                sleep time: 60, unit: 'SECONDS'
+              } // for
+            } catch (e) {
+              // Any unexpected exception in the Prometheus loop — treat as breach and capture logs
+              echo "Prometheus watch error: ${e}"
+              breach = true
             }
           } // end PROM_URL
 
@@ -301,7 +313,7 @@ set -euo pipefail
 helm upgrade --install "$PROD_RELEASE" charts/app -n prod --create-namespace \
   -f env/prod/values.yaml \
   --set image.repository="$IMAGE" \
-  --set image.tag="${SHA}" \
+  --set image.tag="$SHA" \
   --set replicaCount=3
 kubectl rollout status deploy/"$PROD_RELEASE"-app -n prod --timeout=300s
 '''

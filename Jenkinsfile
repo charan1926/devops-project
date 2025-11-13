@@ -2,13 +2,13 @@ pipeline {
   agent any
   options { timestamps() }
   environment {
-    IMAGE        = 'ghcr.io/charan1926/devops-project'
-    DEV_RELEASE  = 'app-dev'
-    STAGE_RELEASE= 'app-stage'
-    PROD_RELEASE = 'app-prod'
-    PROM_CRED_ID = 'prom-url'
-    GHCR_CRED_ID = 'ghcr-creds'
-    KUBE_CRED_ID = 'kubeconfig'
+    IMAGE         = 'ghcr.io/charan1926/devops-project'
+    DEV_RELEASE   = 'app-dev'
+    STAGE_RELEASE = 'app-stage'
+    PROD_RELEASE  = 'app-prod'
+    PROM_CRED_ID  = 'prom-url'
+    GHCR_CRED_ID  = 'ghcr-creds'
+    KUBE_CRED_ID  = 'kubeconfig'
   }
 
   stages {
@@ -16,8 +16,8 @@ pipeline {
       steps {
         checkout scm
         script {
-          // compute short SHA reliably at runtime and export for later stages
-          env.SHA = (env.GIT_COMMIT ?: sh(returnStdout: true, script: 'git rev-parse --short=7 HEAD').trim()).take(7)
+          // Compute short SHA reliably at runtime
+          env.SHA = (env.GIT_COMMIT ?: sh(returnStdout: true, script: "git rev-parse --short=7 HEAD").trim()).take(7)
         }
         echo "Commit SHA: ${env.SHA}"
       }
@@ -25,30 +25,29 @@ pipeline {
 
     stage('Build Image') {
       steps {
-        sh '''
-          cat > Dockerfile <<'DOCKER'
+        sh '''#!/usr/bin/env bash
+set -euo pipefail
+cat > Dockerfile <<'DOCKER'
 FROM python:3.11-slim
 WORKDIR /app
 COPY . /app
 EXPOSE 8080
 CMD ["python3","-m","http.server","8080"]
 DOCKER
-        '''
-        // Use shell expansion of env vars (no Groovy interpolation)
-        sh '''
-          docker build -t "$IMAGE:$SHA" .
-        '''
+docker build -t "$IMAGE:$SHA" .
+'''
       }
     }
 
     stage('Login & Push') {
       steps {
         withCredentials([usernamePassword(credentialsId: env.GHCR_CRED_ID, usernameVariable: 'GHCR_USER', passwordVariable: 'GHCR_PAT')]) {
-          sh '''
-            set -euo pipefail
-            echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-            docker push "$IMAGE:$SHA"
-          '''
+          // DO NOT interpolate secrets in Groovy; use shell expansion of $GHCR_PAT/$GHCR_USER
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
+echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+docker push "$IMAGE:$SHA"
+'''
         }
       }
     }
@@ -56,51 +55,50 @@ DOCKER
     stage('Helm Deploy to DEV (auto)') {
       steps {
         withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-          sh '''
-            set -euo pipefail
+          sh '''#!/usr/bin/env bash
+set -euo pipefail
 
-            helm upgrade --install "$DEV_RELEASE" charts/app -n dev --create-namespace \
-              -f env/dev/values.yaml \
-              --set image.repository="$IMAGE" \
-              --set image.tag="$SHA"
+helm upgrade --install "$DEV_RELEASE" charts/app -n dev --create-namespace \
+  -f env/dev/values.yaml \
+  --set image.repository="$IMAGE" \
+  --set image.tag="$SHA"
 
-            # wait for rollout
-            kubectl rollout status deploy/"$DEV_RELEASE"-app -n dev --timeout=180s
+kubectl rollout status deploy/"$DEV_RELEASE"-app -n dev --timeout=180s
 
-            # robust smoke pod execution and check (poll & dump debug info on failure)
-            kubectl run smoke -n dev --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://$DEV_RELEASE-app:8080 | head -n1; sleep 2"
+# Run a short-lived smoke pod that should finish (use Job in prod)
+kubectl run smoke -n dev --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://$DEV_RELEASE-app:8080 | head -n1; sleep 2"
 
-            timeout_seconds=60; interval=3; elapsed=0
-            while true; do
-              phase=$(kubectl get pod smoke -n dev -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-              echo "dev smoke pod phase: ${phase}"
-              if [ "${phase}" = "Succeeded" ]; then
-                echo "DEV SMOKE SUCCEEDED"
-                break
-              fi
-              if [ "${phase}" = "Failed" ] || [ "$elapsed" -ge $timeout_seconds ]; then
-                echo "DEV SMOKE TIMEOUT/FAILED - collect debug"
-                kubectl describe pod smoke -n dev || true
-                kubectl logs pod/smoke -n dev --all-containers=true || true
-                kubectl get events -n dev --sort-by=.lastTimestamp | tail -n 50 || true
-                kubectl delete pod smoke -n dev --ignore-not-found || true
-                exit 1
-              fi
-              sleep $interval
-              elapsed=$((elapsed + interval))
-            done
+timeout_seconds=60; interval=3; elapsed=0
+while true; do
+  phase=$(kubectl get pod smoke -n dev -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+  echo "dev smoke pod phase: ${phase}"
+  if [ "${phase}" = "Succeeded" ]; then
+    echo "DEV SMOKE SUCCEEDED"
+    break
+  fi
+  if [ "${phase}" = "Failed" ] || [ "$elapsed" -ge $timeout_seconds ]; then
+    echo "DEV SMOKE TIMEOUT/FAILED - collect debug"
+    kubectl describe pod smoke -n dev || true
+    kubectl logs pod/smoke -n dev --all-containers=true || true
+    kubectl get events -n dev --sort-by=.lastTimestamp | tail -n 50 || true
+    kubectl delete pod smoke -n dev --ignore-not-found || true
+    exit 1
+  fi
+  sleep $interval
+  elapsed=$((elapsed + interval))
+done
 
-            kubectl logs pod/smoke -n dev > /tmp/dev-smoke.out 2>&1 || true
-            kubectl delete pod smoke -n dev --ignore-not-found || true
+kubectl logs pod/smoke -n dev > /tmp/dev-smoke.out 2>&1 || true
+kubectl delete pod smoke -n dev --ignore-not-found || true
 
-            if grep -q "<!DOCTYPE HTML>" /tmp/dev-smoke.out; then
-              echo "DEV SMOKE OK"
-            else
-              echo "DEV SMOKE FAILED - output was:"
-              sed -n '1,200p' /tmp/dev-smoke.out || true
-              exit 1
-            fi
-          '''
+if grep -q "<!DOCTYPE HTML>" /tmp/dev-smoke.out; then
+  echo "DEV SMOKE OK"
+else
+  echo "DEV SMOKE FAILED - output was:"
+  sed -n '1,200p' /tmp/dev-smoke.out || true
+  exit 1
+fi
+'''
         }
       }
     }
@@ -110,7 +108,7 @@ DOCKER
         script {
           def report = [
             commit: env.GIT_COMMIT ?: env.SHA ?: 'local',
-            image: "${env.IMAGE}:${env.SHA}",
+            image : "${env.IMAGE}:${env.SHA}",
             timestamp: new Date().toString()
           ]
           writeJSON file: 'build-report.json', json: report
@@ -131,58 +129,62 @@ DOCKER
 
           echo "Promotion approved. Inputs: ${approval}"
 
-          // Deploy canary (replicaCount = 1)
-          withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-            sh '''
-              set -euo pipefail
-              IMAGE_TAG=$(echo "'"${approval.IMAGE_DIGEST}"'" | awk -F: '{print $2}')
-              helm upgrade --install "$STAGE_RELEASE" charts/app -n stage --create-namespace \
-                -f env/stage/values.yaml \
-                --set image.repository="$IMAGE" \
-                --set image.tag="$IMAGE_TAG" \
-                --set replicaCount=1
+          // compute IMAGE_TAG in Groovy (safe) so we don't rely on shell parsing later
+          def imageDigest = approval.IMAGE_DIGEST as String
+          def imageTag = imageDigest.contains(':') ? imageDigest.split(':')[-1] : env.SHA
 
-              kubectl rollout status deploy/"$STAGE_RELEASE"-app -n stage --timeout=180s
-            '''
+          // Deploy canary (replicaCount=1)
+          withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
+            sh """#!/usr/bin/env bash
+set -euo pipefail
+IMAGE_TAG='${imageTag}'
+helm upgrade --install "$STAGE_RELEASE" charts/app -n stage --create-namespace \
+  -f env/stage/values.yaml \
+  --set image.repository="$IMAGE" \
+  --set image.tag="$IMAGE_TAG" \
+  --set replicaCount=1
+
+kubectl rollout status deploy/"$STAGE_RELEASE"-app -n stage --timeout=180s
+"""
           }
 
-          // Smoke test for stage (robust)
+          // Stage smoke (robust)
           withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-            sh '''
-              set -euo pipefail
-              kubectl run smoke -n stage --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://'"$STAGE_RELEASE"'-app:8080 | head -n1; sleep 2"
+            sh '''#!/usr/bin/env bash
+set -euo pipefail
+kubectl run smoke -n stage --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://app-stage-app:8080 | head -n1; sleep 2"
 
-              timeout_seconds=60; interval=3; elapsed=0
-              while true; do
-                phase=$(kubectl get pod smoke -n stage -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-                echo "stage smoke pod phase: ${phase}"
-                if [ "${phase}" = "Succeeded" ]; then
-                  echo "STAGE SMOKE SUCCEEDED"
-                  break
-                fi
-                if [ "${phase}" = "Failed" ] || [ "$elapsed" -ge $timeout_seconds ]; then
-                  echo "STAGE SMOKE TIMEOUT/FAILED - collect debug"
-                  kubectl describe pod smoke -n stage || true
-                  kubectl logs pod/smoke -n stage --all-containers=true || true
-                  kubectl get events -n stage --sort-by=.lastTimestamp | tail -n 50 || true
-                  kubectl delete pod smoke -n stage --ignore-not-found || true
-                  exit 1
-                fi
-                sleep $interval
-                elapsed=$((elapsed + interval))
-              done
+timeout_seconds=60; interval=3; elapsed=0
+while true; do
+  phase=$(kubectl get pod smoke -n stage -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
+  echo "stage smoke pod phase: ${phase}"
+  if [ "${phase}" = "Succeeded" ]; then
+    echo "STAGE SMOKE SUCCEEDED"
+    break
+  fi
+  if [ "${phase}" = "Failed" ] || [ "$elapsed" -ge $timeout_seconds ]; then
+    echo "STAGE SMOKE TIMEOUT/FAILED - collect debug"
+    kubectl describe pod smoke -n stage || true
+    kubectl logs pod/smoke -n stage --all-containers=true || true
+    kubectl get events -n stage --sort-by=.lastTimestamp | tail -n 50 || true
+    kubectl delete pod smoke -n stage --ignore-not-found || true
+    exit 1
+  fi
+  sleep $interval
+  elapsed=$((elapsed + interval))
+done
 
-              kubectl logs pod/smoke -n stage > /tmp/stage-smoke.out 2>&1 || true
-              kubectl delete pod smoke -n stage --ignore-not-found || true
+kubectl logs pod/smoke -n stage > /tmp/stage-smoke.out 2>&1 || true
+kubectl delete pod smoke -n stage --ignore-not-found || true
 
-              if grep -q "<!DOCTYPE HTML>" /tmp/stage-smoke.out; then
-                echo "STAGE SMOKE OK"
-              else
-                echo "STAGE SMOKE FAILED - output was:"
-                sed -n '1,200p' /tmp/stage-smoke.out || true
-                exit 1
-              fi
-            '''
+if grep -q "<!DOCTYPE HTML>" /tmp/stage-smoke.out; then
+  echo "STAGE SMOKE OK"
+else
+  echo "STAGE SMOKE FAILED - output was:"
+  sed -n '1,200p' /tmp/stage-smoke.out || true
+  exit 1
+fi
+'''
           }
 
           // Watch metrics from Prometheus for watch window (10 minutes)
@@ -190,19 +192,18 @@ DOCKER
           def breach = false
 
           withCredentials([string(credentialsId: env.PROM_CRED_ID, variable: 'PROM_URL')]) {
-            // run checks in Groovy loop but perform actual curl inside shell to avoid Groovy interpolation of secrets
             for (int i = 0; i < watchMin; i++) {
-              def errJson = sh(returnStdout: true, script: '''
-                set -euo pipefail
-                errQuery='100 * ( sum(rate(http_requests_total{job=~"app.*",status=~"5.."}[5m])) / sum(rate(http_requests_total{job=~"app.*"}[5m])) )'
-                curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${errQuery}"
-              ''').trim()
+              def errJson = sh(returnStdout: true, script: '''#!/usr/bin/env bash
+set -euo pipefail
+errQuery='100 * ( sum(rate(http_requests_total{job=~"app.*",status=~"5.."}[5m])) / sum(rate(http_requests_total{job=~"app.*"}[5m])) )'
+curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${errQuery}"
+''').trim()
 
-              def p95Json = sh(returnStdout: true, script: '''
-                set -euo pipefail
-                p95Query='histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~"app.*"}[5m])) by (le))'
-                curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${p95Query}"
-              ''').trim()
+              def p95Json = sh(returnStdout: true, script: '''#!/usr/bin/env bash
+set -euo pipefail
+p95Query='histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=~"app.*"}[5m])) by (le))'
+curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${p95Query}"
+''').trim()
 
               def errVal = 0.0
               def p95Val = 0.0
@@ -227,42 +228,44 @@ DOCKER
                 break
               }
               sleep time: 60, unit: 'SECONDS'
-            } // end for
-          } // end withCredentials PROM_URL
+            }
+          } // end PROM_URL
 
           if (breach) {
             echo 'Detected breach — rolling back stage canary'
             withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-              sh '''
-                set -euo pipefail
-                prev_rev=$(helm history "$STAGE_RELEASE" -n stage --max 2 --output json | jq -r '.[1].revision // .[0].revision')
-                if [ -z "$prev_rev" ]; then
-                  echo "No previous helm revision found, aborting rollback"
-                  exit 1
-                fi
-                helm rollback "$STAGE_RELEASE" "$prev_rev" -n stage
-              '''
+              sh '''#!/usr/bin/env bash
+set -euo pipefail
+prev_rev=$(helm history "$STAGE_RELEASE" -n stage --max 2 --output json | jq -r '.[1].revision // .[0].revision' )
+if [ -z "$prev_rev" ]; then
+  echo "No previous helm revision found, aborting rollback"
+  exit 1
+fi
+helm rollback "$STAGE_RELEASE" "$prev_rev" -n stage
+'''
             }
             error "Promotion aborted: SLO breach"
           } else {
             echo 'No breach — scaling to final replicas'
+            // scale to final replicas using Groovy-derived imageTag and user target
             withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-              sh '''
-                set -euo pipefail
-                IMAGE_TAG=$(echo "'"${approval.IMAGE_DIGEST}"'" | awk -F: '{print $2}')
-                helm upgrade --install "$STAGE_RELEASE" charts/app -n stage \
-                  -f env/stage/values.yaml \
-                  --set image.repository="$IMAGE" \
-                  --set image.tag="$IMAGE_TAG" \
-                  --set replicaCount='"${approval.TARGET_REPLICAS}"'
-                kubectl rollout status deploy/"$STAGE_RELEASE"-app -n stage --timeout=240s
-              '''
+              sh """#!/usr/bin/env bash
+set -euo pipefail
+IMAGE_TAG='${imageTag}'
+TARGET_REPLICAS='${approval.TARGET_REPLICAS}'
+helm upgrade --install "$STAGE_RELEASE" charts/app -n stage \
+  -f env/stage/values.yaml \
+  --set image.repository="$IMAGE" \
+  --set image.tag="$IMAGE_TAG" \
+  --set replicaCount=$TARGET_REPLICAS
+kubectl rollout status deploy/"$STAGE_RELEASE"-app -n stage --timeout=240s
+"""
             }
             echo "Stage promotion completed successfully."
           }
         } // end script
       } // end steps
-    } // end Stage promotion
+    } // end Promote to STAGE
 
     stage('Release to PROD (tag-driven)') {
       when {
@@ -278,15 +281,15 @@ DOCKER
           input message: "Approve release ${tag} to PROD?", parameters: [string(name:'CHANGELOG', defaultValue:'', description:'Release notes')]
 
           withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-            sh '''
-              set -euo pipefail
-              helm upgrade --install "$PROD_RELEASE" charts/app -n prod --create-namespace \
-                -f env/prod/values.yaml \
-                --set image.repository="$IMAGE" \
-                --set image.tag="$SHA" \
-                --set replicaCount=3
-              kubectl rollout status deploy/"$PROD_RELEASE"-app -n prod --timeout=300s
-            '''
+            sh '''#!/usr/bin/env bash
+set -euo pipefail
+helm upgrade --install "$PROD_RELEASE" charts/app -n prod --create-namespace \
+  -f env/prod/values.yaml \
+  --set image.repository="$IMAGE" \
+  --set image.tag="$SHA" \
+  --set replicaCount=3
+kubectl rollout status deploy/"$PROD_RELEASE"-app -n prod --timeout=300s
+'''
           }
 
           echo "Prod release done for ${tag}"

@@ -2,8 +2,7 @@ pipeline {
   agent any
   options {
     timestamps()
-    // Allow manual override paths even when the pipeline is unstable
-    skipStagesAfterUnstable(false)
+    skipStagesAfterUnstable()
   }
   parameters {
     booleanParam(name: 'FORCE_PROD', defaultValue: false, description: 'Force PROD deployment even if earlier stages failed')
@@ -17,7 +16,6 @@ pipeline {
     GHCR_CRED_ID  = 'ghcr-creds'
     KUBE_CRED_ID  = 'kubeconfig'
   }
-
   stages {
     stage('Checkout') {
       steps {

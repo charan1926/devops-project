@@ -39,7 +39,7 @@ COPY . /app
 EXPOSE 8080
 CMD ["python3","-m","http.server","8080"]
 DOCKER
-docker build -t "$IMAGE:$SHA" .
+docker build -t "$IMAGE:${SHA}" .
 '''
       }
     }
@@ -50,7 +50,7 @@ docker build -t "$IMAGE:$SHA" .
           sh '''#!/usr/bin/env bash
 set -euo pipefail
 echo "$GHCR_PAT" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
-docker push "$IMAGE:$SHA"
+docker push "$IMAGE:${SHA}"
 '''
         }
       }
@@ -66,7 +66,7 @@ set -euo pipefail
 helm upgrade --install "$DEV_RELEASE" charts/app -n dev --create-namespace \
   -f env/dev/values.yaml \
   --set image.repository="$IMAGE" \
-  --set image.tag="$SHA"
+  --set image.tag="${SHA}"
 
 kubectl rollout status deploy/"$DEV_RELEASE"-app -n dev --timeout=180s
 
@@ -135,14 +135,21 @@ fi
           echo "Promotion approved. Inputs: ${approval}"
 
           // compute image tag safely in Groovy
-          def imageDigest = approval.IMAGE_DIGEST as String
+          def imageDigest = (approval.IMAGE_DIGEST as String).trim()
           def imageTag = imageDigest.contains(':') ? imageDigest.split(':')[-1] : env.SHA
+          echo "Computed imageTag (groovy): ${imageTag}"
+
+          // export to env so shell can use it (and avoid Groovy interpolation problems)
+          env.IMAGE_TAG = imageTag
+          env.TARGET_REPLICAS = (approval.TARGET_REPLICAS as String).trim()
+
+          echo "exported env.IMAGE_TAG=${env.IMAGE_TAG}"
+          echo "exported env.TARGET_REPLICAS=${env.TARGET_REPLICAS}"
 
           // Deploy canary (replicaCount=1)
           withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-            sh """#!/usr/bin/env bash
+            sh '''#!/usr/bin/env bash
 set -euo pipefail
-IMAGE_TAG='${imageTag}'
 helm upgrade --install "$STAGE_RELEASE" charts/app -n stage --create-namespace \
   -f env/stage/values.yaml \
   --set image.repository="$IMAGE" \
@@ -150,7 +157,7 @@ helm upgrade --install "$STAGE_RELEASE" charts/app -n stage --create-namespace \
   --set replicaCount=1
 
 kubectl rollout status deploy/"$STAGE_RELEASE"-app -n stage --timeout=180s
-"""
+'''
           }
 
           // Stage smoke (robust)
@@ -253,17 +260,15 @@ helm rollback "$STAGE_RELEASE" "$prev_rev" -n stage
           } else {
             echo 'No breach — scaling to final replicas'
             withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
-              sh """#!/usr/bin/env bash
+              sh '''#!/usr/bin/env bash
 set -euo pipefail
-IMAGE_TAG='${imageTag}'
-TARGET_REPLICAS='${approval.TARGET_REPLICAS}'
 helm upgrade --install "$STAGE_RELEASE" charts/app -n stage \
   -f env/stage/values.yaml \
   --set image.repository="$IMAGE" \
   --set image.tag="$IMAGE_TAG" \
   --set replicaCount=$TARGET_REPLICAS
 kubectl rollout status deploy/"$STAGE_RELEASE"-app -n stage --timeout=240s
-"""
+'''
             }
             echo "Stage promotion completed successfully."
           }
@@ -296,7 +301,7 @@ set -euo pipefail
 helm upgrade --install "$PROD_RELEASE" charts/app -n prod --create-namespace \
   -f env/prod/values.yaml \
   --set image.repository="$IMAGE" \
-  --set image.tag="$SHA" \
+  --set image.tag="${SHA}" \
   --set replicaCount=3
 kubectl rollout status deploy/"$PROD_RELEASE"-app -n prod --timeout=300s
 '''

@@ -2,13 +2,12 @@ pipeline {
   agent any
   options {
     timestamps()
-    // allow manual override paths to run even if earlier stages are unstable/failed
+    // Allow manual override paths even when the pipeline is unstable
     skipStagesAfterUnstable(false)
   }
   parameters {
     booleanParam(name: 'FORCE_PROD', defaultValue: false, description: 'Force PROD deployment even if earlier stages failed')
   }
-
   environment {
     IMAGE         = 'ghcr.io/charan1926/devops-project'
     DEV_RELEASE   = 'app-dev'
@@ -24,7 +23,7 @@ pipeline {
       steps {
         checkout scm
         script {
-          // Compute short SHA reliably at runtime
+          // Compute short SHA reliably at runtime and export to env
           env.SHA = (env.GIT_COMMIT ?: sh(returnStdout: true, script: "git rev-parse --short=7 HEAD").trim()).take(7)
         }
         echo "Commit SHA: ${env.SHA}"
@@ -61,6 +60,7 @@ docker push "$IMAGE:$SHA"
 
     stage('Helm Deploy to DEV (auto)') {
       steps {
+        // This stage is critical; allow it to fail the build if smoke fails
         withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
           sh '''#!/usr/bin/env bash
 set -euo pipefail
@@ -72,7 +72,7 @@ helm upgrade --install "$DEV_RELEASE" charts/app -n dev --create-namespace \
 
 kubectl rollout status deploy/"$DEV_RELEASE"-app -n dev --timeout=180s
 
-# Run a short-lived smoke pod that should finish quickly
+# Run a short-lived smoke pod (use Job in prod)
 kubectl run smoke -n dev --restart=Never --image=busybox:1.36 -- /bin/sh -c "wget -qO- http://$DEV_RELEASE-app:8080 | head -n1; sleep 2"
 
 timeout_seconds=60; interval=3; elapsed=0
@@ -136,7 +136,7 @@ fi
 
           echo "Promotion approved. Inputs: ${approval}"
 
-          // compute IMAGE_TAG in Groovy (safe)
+          // compute image tag safely in Groovy
           def imageDigest = approval.IMAGE_DIGEST as String
           def imageTag = imageDigest.contains(':') ? imageDigest.split(':')[-1] : env.SHA
 
@@ -243,7 +243,7 @@ curl -s -G "$PROM_URL/api/v1/query" --data-urlencode "query=${p95Query}"
             withCredentials([file(credentialsId: env.KUBE_CRED_ID, variable: 'KUBECONFIG')]) {
               sh '''#!/usr/bin/env bash
 set -euo pipefail
-prev_rev=$(helm history "$STAGE_RELEASE" -n stage --max 2 --output json | jq -r '.[1].revision // .[0].revision' )
+prev_rev=$(helm history "$STAGE_RELEASE" -n stage --max 2 --output json | jq -r '.[1].revision // .[0].revision')
 if [ -z "$prev_rev" ]; then
   echo "No previous helm revision found, aborting rollback"
   exit 1
@@ -276,21 +276,15 @@ kubectl rollout status deploy/"$STAGE_RELEASE"-app -n stage --timeout=240s
     stage('Release to PROD (tag-driven)') {
       when {
         expression {
-          // Run if there's a tag OR user explicitly set FORCE_PROD to true
+          // Run if there's a tag OR user explicitly set FORCE_PROD (parameter) to true
           return (env.GIT_TAG ?: '') as boolean || (params.FORCE_PROD == true)
         }
       }
       steps {
         script {
-          // If build already failed/unstable and user didn't set FORCE_PROD, skip to be safe.
-          if ((currentBuild.currentResult == 'FAILURE' || currentBuild.currentResult == 'UNSTABLE') && !params.FORCE_PROD) {
-            echo "Pipeline is in ${currentBuild.currentResult} state. Skipping PROD unless FORCE_PROD is true."
-            error "Skipping PROD due to earlier failures"
-          }
-
-          // If forcing despite failures, require an extra confirmation
-          if ((currentBuild.currentResult == 'FAILURE' || currentBuild.currentResult == 'UNSTABLE') && params.FORCE_PROD) {
-            input message: "Pipeline is ${currentBuild.currentResult}. You have set FORCE_PROD=true. Confirm you want to PROCEED to PROD (this will be recorded)."
+          // If pipeline already failed or unstable, require an extra confirmation
+          if (currentBuild.currentResult == 'FAILURE' || currentBuild.currentResult == 'UNSTABLE') {
+            input message: "Pipeline is ${currentBuild.currentResult}. Are you SURE you want to proceed to PROD? (this requires manual confirmation)"
           }
 
           def tag = env.GIT_TAG ?: env.BRANCH_NAME
